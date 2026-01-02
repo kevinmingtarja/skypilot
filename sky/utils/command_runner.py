@@ -1457,8 +1457,8 @@ class LocalProcessCommandRunner(CommandRunner):
 class SlurmCommandRunner(SSHCommandRunner):
     """Runner for Slurm commands.
 
-    SlurmCommandRunner sends commands over an SSH connection through the Slurm
-    controller, to the virtual instances.
+    SlurmCommandRunner sends commands via srun over an SSH connection to the
+    Slurm login node, executing them on compute nodes within the job allocation.
     """
 
     def __init__(
@@ -1502,42 +1502,14 @@ class SlurmCommandRunner(SSHCommandRunner):
             **kwargs: Additional arguments forwarded to SSHCommandRunner
               (e.g., ssh_proxy_command).
         """
+        # Initialize with connection to login node
         super().__init__(node, ssh_user, ssh_private_key, **kwargs)
         self.sky_dir = sky_dir
         self.skypilot_runtime_dir = skypilot_runtime_dir
         self.job_id = job_id
         self.slurm_node = slurm_node
-
-        # Build a chained ProxyCommand that goes through the login node to reach
-        # the compute node where the job is running.
-
-        # First, build SSH options to reach the login node, using the user's
-        # existing proxy command or proxy jump if provided.
-        proxy_ssh_options = ' '.join(
-            ssh_options_list(
-                self.ssh_private_key,
-                self.ssh_control_name,
-                ssh_proxy_command=self._ssh_proxy_command,
-                ssh_proxy_jump=self._ssh_proxy_jump,
-                port=self.port,
-                disable_control_master=self.disable_control_master,
-                # We need to escape the %C on the ControlPath,
-                # since this is going to be embedded in a
-                # ProxyCommand.
-                escape_percent_expand=True))
-        login_node_proxy_command = (f'ssh {proxy_ssh_options} '
-                                    f'-W %h:%p {self.ssh_user}@{self.ip}')
-
-        # Update the proxy command to be the login node proxy, which will
-        # be used by super().run() to reach the compute node.
-        self._ssh_proxy_command = login_node_proxy_command
-        # Clear the proxy jump since it's now embedded in the proxy command.
-        self._ssh_proxy_jump = None
-        # Update self.ip to target the compute node.
-        self.ip = slurm_node
-        # Assume the compute node's SSH port is 22.
-        # TODO(kevin): Make this configurable if needed.
-        self.port = 22
+        # Note: self.ip and self.port now refer to the login node, not the
+        # compute node. Commands will be executed on the compute node via srun.
 
     def rsync(
         self,
@@ -1560,15 +1532,29 @@ class SlurmCommandRunner(SSHCommandRunner):
         # if the target dir is in a shared filesystem, since it will
         # be accessible by the compute node.
 
-        # Build SSH options for rsync using the ProxyCommand set up in __init__
-        # to reach the compute node through the login node.
+        # Build a ProxyCommand that chains through the login node to reach
+        # the compute node, similar to the old __init__ approach.
+        # First, build SSH options to reach the login node.
+        proxy_ssh_options = ' '.join(
+            ssh_options_list(
+                self.ssh_private_key,
+                self.ssh_control_name,
+                ssh_proxy_command=self._ssh_proxy_command,
+                ssh_proxy_jump=self._ssh_proxy_jump,
+                port=self.port,
+                disable_control_master=self.disable_control_master,
+                # Escape %C since this will be embedded in a ProxyCommand
+                escape_percent_expand=True))
+        # Build the chained ProxyCommand
+        login_node_proxy_command = (f'ssh {proxy_ssh_options} '
+                                    f'-W %h:%p {self.ssh_user}@{self.ip}')
+
+        # Build SSH options for rsync using the chained ProxyCommand
         ssh_options = ' '.join(
             ssh_options_list(
-                # Use the same private key as the one used for
-                # connecting to the login node.
                 self.ssh_private_key,
                 None,
-                ssh_proxy_command=self._ssh_proxy_command,
+                ssh_proxy_command=login_node_proxy_command,
                 disable_control_master=True))
         rsh_option = f'ssh {ssh_options}'
 
@@ -1588,7 +1574,7 @@ class SlurmCommandRunner(SSHCommandRunner):
     @context_utils.cancellation_guard
     def run(self, cmd: Union[str, List[str]],
             **kwargs) -> Union[int, Tuple[int, str, str]]:
-        """Run Slurm-supported user commands over an SSH connection.
+        """Run Slurm-supported user commands via srun on the compute node.
 
         Args:
             cmd: The Slurm-supported user command to run.
@@ -1605,14 +1591,14 @@ class SlurmCommandRunner(SSHCommandRunner):
         # And similarly for SKY_RUNTIME_DIR. See constants.\
         # SKY_RUNTIME_DIR_ENV_VAR_KEY for more details.
         #
-        # SSH directly to the compute node instead of using srun.
-        # This avoids Slurm's proctrack/cgroup which kills all processes
-        # when the job step ends (including child processes launched as
-        # a separate process group), breaking background process spawning
-        # (e.g., JobScheduler._run_job which uses launch_new_process_tree).
-        # Note: proctrack/cgroup is enabled by default on Nebius'
-        # Managed Soperator.
-        cmd = (
+        # Use srun to execute commands on the compute node. This uses Slurm's
+        # native command execution mechanism instead of SSH proxy.
+        # --quiet: Suppress srun informational messages
+        # --unbuffered: Do not buffer stdout/stderr
+        # --overlap: Allow this srun to share resources with other job steps
+        # --jobid: Specify the job ID to run within
+        # -w: Specify the node to run on
+        env_setup = (
             f'export {constants.SKY_RUNTIME_DIR_ENV_VAR_KEY}='
             f'"{self.skypilot_runtime_dir}" && '
             # Set the uv cache directory to /tmp/uv_cache_$(id -u) to speed up
@@ -1622,4 +1608,10 @@ class SlurmCommandRunner(SSHCommandRunner):
             f'export UV_CACHE_DIR=/tmp/uv_cache_$(id -u) && '
             f'cd {self.sky_dir} && export HOME=$(pwd) && {cmd}')
 
-        return super().run(cmd, **kwargs)
+        # Wrap the command with srun to execute on the compute node
+        srun_cmd = (
+            f'srun --quiet --unbuffered --overlap '
+            f'--jobid {self.job_id} -w {self.slurm_node} '
+            f'/bin/bash -c {shlex.quote(env_setup)}')
+
+        return super().run(srun_cmd, **kwargs)
