@@ -301,3 +301,116 @@ class TestSSHCommandRunnerInteractiveAuth:
             handler_thread.join(timeout=2)
             if os.path.exists(log_path):
                 os.unlink(log_path)
+
+    def test_interactive_auth_serialization(self):
+        """Test that concurrent interactive auth attempts are serialized.
+
+        This verifies that the global lock prevents multiple threads from
+        simultaneously performing interactive authentication, which would
+        cause file descriptor conflicts.
+        """
+        # Track execution order and concurrency
+        execution_log = []
+        lock_acquired_count = []
+        max_concurrent = [0]
+        current_concurrent = [0]
+        execution_lock = threading.Lock()
+
+        # Create a mock runner
+        runner = command_runner.SSHCommandRunner(
+            node=('127.0.0.1', 22),
+            ssh_user='testuser',
+            ssh_private_key=None,
+            ssh_control_name=None,
+        )
+
+        # Mock the actual SSH execution to avoid real connections
+        original_run_with_log = None
+
+        def mock_run_with_log(*args, **kwargs):
+            """Mock that simulates SSH execution with some delay."""
+            thread_id = threading.current_thread().ident
+
+            with execution_lock:
+                current_concurrent[0] += 1
+                max_concurrent[0] = max(max_concurrent[0], current_concurrent[0])
+                execution_log.append(('start', thread_id))
+
+            # Simulate some work
+            time.sleep(0.1)
+
+            with execution_lock:
+                current_concurrent[0] -= 1
+                execution_log.append(('end', thread_id))
+
+            return 0  # Success
+
+        # Patch run_with_log
+        import sky.skylet.log_lib as log_lib
+        original_run_with_log = log_lib.run_with_log
+        log_lib.run_with_log = mock_run_with_log
+
+        try:
+            # Spawn multiple threads that try to do interactive auth concurrently
+            num_threads = 3
+            threads = []
+            results = [None] * num_threads
+
+            def run_auth(index):
+                session_id = f'test-session-{index}'
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.log',
+                                                 delete=False) as f:
+                    log_path = f.name
+
+                try:
+                    # Call _retry_with_interactive_auth
+                    # This should be serialized by the global lock
+                    result = runner._retry_with_interactive_auth(  # pylint: disable=protected-access
+                        session_id=session_id,
+                        command=['ssh', 'testuser@127.0.0.1', 'echo', 'test'],
+                        log_path=log_path,
+                        require_outputs=False,
+                        process_stream=False,
+                        stream_logs=False,
+                        executable='/bin/bash',
+                    )
+                    results[index] = result
+                finally:
+                    if os.path.exists(log_path):
+                        os.unlink(log_path)
+
+            for i in range(num_threads):
+                t = threading.Thread(target=run_auth, args=(i,))
+                threads.append(t)
+                t.start()
+
+            # Wait for all threads to complete
+            for t in threads:
+                t.join(timeout=10)
+
+            # Verify that authentication was serialized (max 1 concurrent)
+            assert max_concurrent[
+                0] == 1, f'Expected max 1 concurrent execution, got {max_concurrent[0]}'
+
+            # Verify all threads completed successfully
+            assert all(r == 0 for r in results
+                      ), f'Some threads failed: {results}'
+
+            # Verify execution log shows proper serialization
+            # Each 'start' should be followed by its corresponding 'end'
+            # before the next 'start'
+            active_threads = set()
+            for event, thread_id in execution_log:
+                if event == 'start':
+                    assert thread_id not in active_threads, \
+                        f'Thread {thread_id} started while still active'
+                    active_threads.add(thread_id)
+                elif event == 'end':
+                    assert thread_id in active_threads, \
+                        f'Thread {thread_id} ended but was not active'
+                    active_threads.remove(thread_id)
+
+        finally:
+            # Restore original run_with_log
+            if original_run_with_log is not None:
+                log_lib.run_with_log = original_run_with_log

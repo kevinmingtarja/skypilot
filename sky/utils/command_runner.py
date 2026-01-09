@@ -34,6 +34,11 @@ from sky.utils import timeline
 
 logger = sky_logging.init_logger(__name__)
 
+# Global lock to serialize interactive SSH authentication attempts.
+# This prevents multiple threads from simultaneously trying to use stdin/stdout
+# for interactive authentication, which would cause file descriptor conflicts.
+_INTERACTIVE_AUTH_LOCK = threading.Lock()
+
 # Pattern to extract home directory from command output
 _HOME_DIR_PATTERN = re.compile(r'SKYPILOT_HOME_DIR: ([^\s\n]+)')
 
@@ -785,6 +790,14 @@ class SSHCommandRunner(CommandRunner):
                 else:
                     ssh += ['-NL']
                 ssh += [f'{local}:localhost:{remote}']
+
+        # When interactive auth is enabled, capture SSH diagnostic messages
+        # to a temp file so we can distinguish auth failures from other errors.
+        # This allows us to avoid unnecessary interactive auth retries for
+        # non-auth errors (connection refused, timeout, etc).
+        if self.enable_interactive_auth and hasattr(self, '_ssh_diag_log'):
+            ssh += ['-E', self._ssh_diag_log]
+
         if self._docker_ssh_proxy_command is not None:
             docker_ssh_proxy_command = self._docker_ssh_proxy_command(ssh)
         else:
@@ -818,109 +831,117 @@ class SSHCommandRunner(CommandRunner):
         normal stdout/stderr pipes, which gets printed to log_path.
 
         See ssh_options_list for when ControlMaster is not enabled.
+
+        Note: This method uses a global lock to serialize interactive auth
+        attempts across threads, as interactive authentication requires
+        exclusive access to stdin/stdout.
         """
-        extra_options = [
-            # Override ControlPersist to reduce frequency of manual user
-            # intervention. The default from ssh_options_list is only 5m.
-            #
-            # NOTE: When used with ProxyJump, the connection can die
-            # earlier than expected, so it is recommended to also enable
-            # ControlMaster on the jump host's SSH config. It is hard to
-            # tell why exactly, because enabling -v makes this problem
-            # disappear for some reasons.
-            '-o',
-            'ControlPersist=1d',
-        ]
-        if self._ssh_proxy_jump is not None:
-            logger.warning(f'{colorama.Fore.YELLOW}When using ProxyJump, it is '
-                           'recommended to also enable ControlMaster on the '
-                           'jump host\'s SSH config to keep the authenticated '
-                           f'connection alive for longer.{colorama.Fore.RESET}')
-        command = command[:1] + extra_options + command[1:]
+        # Acquire global lock to serialize interactive authentication attempts.
+        # This prevents multiple threads from interfering with each other's
+        # terminal I/O and file descriptors.
+        with _INTERACTIVE_AUTH_LOCK:
+            extra_options = [
+                # Override ControlPersist to reduce frequency of manual user
+                # intervention. The default from ssh_options_list is only 5m.
+                #
+                # NOTE: When used with ProxyJump, the connection can die
+                # earlier than expected, so it is recommended to also enable
+                # ControlMaster on the jump host's SSH config. It is hard to
+                # tell why exactly, because enabling -v makes this problem
+                # disappear for some reasons.
+                '-o',
+                'ControlPersist=1d',
+            ]
+            if self._ssh_proxy_jump is not None:
+                logger.warning(f'{colorama.Fore.YELLOW}When using ProxyJump, it is '
+                               'recommended to also enable ControlMaster on the '
+                               'jump host\'s SSH config to keep the authenticated '
+                               f'connection alive for longer.{colorama.Fore.RESET}')
+            command = command[:1] + extra_options + command[1:]
 
-        # Create PTY for SSH. PTY slave for stdin from user, PTY master
-        # for password/auth prompts from SSH.
-        pty_m_fd, pty_s_fd = pty.openpty()
+            # Create PTY for SSH. PTY slave for stdin from user, PTY master
+            # for password/auth prompts from SSH.
+            pty_m_fd, pty_s_fd = pty.openpty()
 
-        # Create Unix socket to pass PTY master fd to websocket handler
-        fd_socket_path = interactive_utils.get_pty_socket_path(session_id)
-        if os.path.exists(fd_socket_path):
-            os.unlink(fd_socket_path)
-        fd_server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        fd_server.bind(fd_socket_path)
-        fd_server.listen(1)
-        fd_server.settimeout(60)
-
-        # Signal client to initiate websocket for interactive auth
-        interactive_signal = f'<sky-interactive session="{session_id}"/>'
-        print(interactive_signal, flush=True)
-
-        def handle_unix_socket_connection():
-            """Background thread to handle Unix socket connection."""
-            conn = None
-            try:
-                # Wait for websocket handler to connect.
-                conn, _ = fd_server.accept()
-                # Send PTY master fd through Unix socket.
-                interactive_utils.send_fd(conn, pty_m_fd)
-                # We don't need to block here to wait for the websocket
-                # handler, as SSH will continue by itself once auth
-                # is complete.
-            except socket.timeout:
-                logger.debug('Timeout waiting for interactive auth connection')
-            except Exception as e:  # pylint: disable=broad-except
-                logger.error(f'Error in Unix socket connection: '
-                             f'{common_utils.format_exception(e)}')
-            finally:
-                if conn is not None:
-                    try:
-                        conn.close()
-                    except Exception:  # pylint: disable=broad-except
-                        pass
-                try:
-                    os.close(pty_m_fd)
-                except Exception:  # pylint: disable=broad-except
-                    pass
-
-        unix_sock_thread = threading.Thread(
-            target=handle_unix_socket_connection, daemon=True)
-        unix_sock_thread.start()
-
-        try:
-
-            def setup_pty_session():
-                # Set PTY as controlling terminal so SSH can access /dev/tty
-                # for keyboard-interactive auth. Without this:
-                # "can't open /dev/tty: Device not configured"
-                fcntl.ioctl(pty_s_fd, termios.TIOCSCTTY, 0)
-                # Ignore SIGHUP so ControlMaster survives when PTY closes.
-                signal.signal(signal.SIGHUP, signal.SIG_IGN)
-                # Ignore SIGTERM so ControlMaster survives subprocess_daemon
-                # killing the process group.
-                if self._ssh_proxy_jump is not None:
-                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-
-            return log_lib.run_with_log(' '.join(command),
-                                        log_path,
-                                        require_outputs=require_outputs,
-                                        stream_logs=stream_logs,
-                                        process_stream=process_stream,
-                                        shell=True,
-                                        executable=executable,
-                                        preexec_fn=setup_pty_session,
-                                        **kwargs)
-        except Exception as e:
-            raise RuntimeError(f'Exception in setup: {e}') from e
-        finally:
-            # Clean up PTY fds and sockets.
-            fd_server.close()
+            # Create Unix socket to pass PTY master fd to websocket handler
+            fd_socket_path = interactive_utils.get_pty_socket_path(session_id)
             if os.path.exists(fd_socket_path):
                 os.unlink(fd_socket_path)
+            fd_server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            fd_server.bind(fd_socket_path)
+            fd_server.listen(1)
+            fd_server.settimeout(60)
+
+            # Signal client to initiate websocket for interactive auth
+            interactive_signal = f'<sky-interactive session="{session_id}"/>'
+            print(interactive_signal, flush=True)
+
+            def handle_unix_socket_connection():
+                """Background thread to handle Unix socket connection."""
+                conn = None
+                try:
+                    # Wait for websocket handler to connect.
+                    conn, _ = fd_server.accept()
+                    # Send PTY master fd through Unix socket.
+                    interactive_utils.send_fd(conn, pty_m_fd)
+                    # We don't need to block here to wait for the websocket
+                    # handler, as SSH will continue by itself once auth
+                    # is complete.
+                except socket.timeout:
+                    logger.debug('Timeout waiting for interactive auth connection')
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.error(f'Error in Unix socket connection: '
+                                 f'{common_utils.format_exception(e)}')
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:  # pylint: disable=broad-except
+                            pass
+                    try:
+                        os.close(pty_m_fd)
+                    except Exception:  # pylint: disable=broad-except
+                        pass
+
+            unix_sock_thread = threading.Thread(
+                target=handle_unix_socket_connection, daemon=True)
+            unix_sock_thread.start()
+
             try:
-                os.close(pty_m_fd)
-            except OSError:
-                pass  # Already closed by background thread
-            os.close(pty_s_fd)
+
+                def setup_pty_session():
+                    # Set PTY as controlling terminal so SSH can access /dev/tty
+                    # for keyboard-interactive auth. Without this:
+                    # "can't open /dev/tty: Device not configured"
+                    fcntl.ioctl(pty_s_fd, termios.TIOCSCTTY, 0)
+                    # Ignore SIGHUP so ControlMaster survives when PTY closes.
+                    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+                    # Ignore SIGTERM so ControlMaster survives subprocess_daemon
+                    # killing the process group.
+                    if self._ssh_proxy_jump is not None:
+                        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+                return log_lib.run_with_log(' '.join(command),
+                                            log_path,
+                                            require_outputs=require_outputs,
+                                            stream_logs=stream_logs,
+                                            process_stream=process_stream,
+                                            shell=True,
+                                            executable=executable,
+                                            preexec_fn=setup_pty_session,
+                                            **kwargs)
+            except Exception as e:
+                raise RuntimeError(f'Exception in setup: {e}') from e
+            finally:
+                # Clean up PTY fds and sockets.
+                fd_server.close()
+                if os.path.exists(fd_socket_path):
+                    os.unlink(fd_socket_path)
+                try:
+                    os.close(pty_m_fd)
+                except OSError:
+                    pass  # Already closed by background thread
+                os.close(pty_s_fd)
 
     def close_cached_connection(self) -> None:
         """Close the cached connection to the remote machine.
@@ -992,6 +1013,12 @@ class SSHCommandRunner(CommandRunner):
             or
             A tuple of (returncode, stdout, stderr).
         """
+        # Create temp file for SSH diagnostic output when interactive auth is enabled
+        if self.enable_interactive_auth:
+            # Create a persistent temp file that won't be auto-deleted
+            fd, self._ssh_diag_log = tempfile.mkstemp(suffix='.ssh_diag',
+                                                       prefix='skypilot_')
+            os.close(fd)  # Close the file descriptor, SSH will write to it
 
         base_ssh_command = self.ssh_base_command(
             ssh_mode=ssh_mode,
@@ -1044,17 +1071,66 @@ class SSHCommandRunner(CommandRunner):
             returncode = result
 
         if returncode != 255:
+            # Success or non-SSH error, clean up and return
+            if hasattr(self, '_ssh_diag_log') and os.path.exists(self._ssh_diag_log):
+                try:
+                    os.unlink(self._ssh_diag_log)
+                except OSError:
+                    pass
             return result
-        # Exit code 255 indicates an SSH connection error. It does not
-        # necessarily mean an auth failure, but when ControlMaster is used,
-        # the stdout/stderr does not contain the auth failure message,
-        # which is why we don't check the output here, and just attempt
-        # the interactive auth flow.
+
+        # Exit code 255 indicates an SSH connection error. Check if it's
+        # an authentication failure (which warrants interactive auth retry)
+        # or another type of error (connection refused, timeout, etc).
+        # With -E flag, SSH diagnostic messages are captured to _ssh_diag_log.
+        should_retry_auth = False
+        if hasattr(self, '_ssh_diag_log') and os.path.exists(self._ssh_diag_log):
+            try:
+                with open(self._ssh_diag_log, 'r') as f:
+                    diag_output = f.read().lower()
+                    # Check for authentication-related error messages
+                    auth_error_patterns = [
+                        'permission denied',
+                        'authentication failed',
+                        'publickey',
+                        'keyboard-interactive',
+                        'could not authenticate',
+                    ]
+                    should_retry_auth = any(pattern in diag_output
+                                           for pattern in auth_error_patterns)
+                    if not should_retry_auth:
+                        logger.debug(f'SSH error (not auth-related): {diag_output.strip()}')
+            except Exception as e:  # pylint: disable=broad-except
+                logger.debug(f'Failed to read SSH diagnostic log: {e}')
+                # If we can't read the log, conservatively assume it might be auth
+                should_retry_auth = True
+        else:
+            # No diagnostic log available, conservatively retry with auth
+            should_retry_auth = True
+
+        if not should_retry_auth:
+            # Non-auth error, don't retry with interactive auth
+            if hasattr(self, '_ssh_diag_log') and os.path.exists(self._ssh_diag_log):
+                try:
+                    os.unlink(self._ssh_diag_log)
+                except OSError:
+                    pass
+            return result
+
+        logger.info('SSH authentication may be required, starting interactive auth...')
         session_id = str(uuid.uuid4())
-        return self._retry_with_interactive_auth(session_id, command, log_path,
-                                                 require_outputs,
-                                                 process_stream, stream_logs,
-                                                 executable, **kwargs)
+        try:
+            return self._retry_with_interactive_auth(session_id, command, log_path,
+                                                     require_outputs,
+                                                     process_stream, stream_logs,
+                                                     executable, **kwargs)
+        finally:
+            # Clean up temp diagnostic log file
+            if hasattr(self, '_ssh_diag_log') and os.path.exists(self._ssh_diag_log):
+                try:
+                    os.unlink(self._ssh_diag_log)
+                except OSError:
+                    pass
 
     @timeline.event
     def rsync(
