@@ -60,7 +60,11 @@ export async function getClusters({ clusterNames = null } = {}) {
     const clusterData = clusters.map((cluster) => {
       // Use cluster_hash for lookup, assuming it's directly in cluster.cluster_hash
       let region_or_zone = '';
-      if (cluster.zone) {
+      // For Slurm, zones = partitions. We want to show the cluster name
+      // (region) instead of the partition name (zone), as different Slurm
+      // clusters can easily have the same partition name.
+      const is_slurm = cluster.cloud?.toLowerCase() === 'slurm';
+      if (cluster.zone && !is_slurm) {
         region_or_zone = cluster.zone;
       } else {
         region_or_zone = cluster.region;
